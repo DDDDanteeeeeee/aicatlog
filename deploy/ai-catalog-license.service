@@ -1,0 +1,16 @@
+[Unit]
+Description=AI Catalog Agent License Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ai-catalog-license
+EnvironmentFile=/etc/ai-catalog-license.env
+ExecStart=/usr/bin/node /opt/ai-catalog-license/server/license-server.mjs
+Restart=always
+RestartSec=3
+User=aiagent
+Group=aiagent
+
+[Install]
+WantedBy=multi-user.target

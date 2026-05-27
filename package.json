@@ -1,0 +1,111 @@
+{
+  "name": "ai-catalog-agent",
+  "version": "1.0.4",
+  "description": "Local control shell for editable Illustrator catalog translation",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "electron:dev": "concurrently -k \"npm:dev\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "tsc -b && vite build",
+    "test": "node --test tests/*.test.mjs",
+    "agent:runner": "node scripts/agent-runner.mjs",
+    "license:server": "node server/license-server.mjs",
+    "license:create": "node scripts/license-admin.mjs create",
+    "license:list": "node scripts/license-admin.mjs list",
+    "license:remote": "node scripts/license-admin-remote.mjs",
+    "smoke:product": "node scripts/product-smoke.mjs",
+    "package:win": "npm run build && electron-builder --win nsis --x64",
+    "preview": "vite preview --host 127.0.0.1",
+    "hf:doctor": "node scripts/hyperframes-with-media-path.mjs doctor",
+    "hf:lint": "node scripts/hyperframes-with-media-path.mjs lint video/hyperframes",
+    "hf:inspect": "node scripts/hyperframes-with-media-path.mjs inspect video/hyperframes",
+    "hf:preview": "node scripts/hyperframes-with-media-path.mjs preview video/hyperframes --port 3002",
+    "hf:render": "node scripts/hyperframes-with-media-path.mjs render video/hyperframes --output artifacts/hyperframes-codex-workflow.mp4 --quality draft",
+    "remotion:studio": "node scripts/remotion-with-local-chrome.mjs studio src/remotion/index.ts",
+    "remotion:still": "node scripts/remotion-with-local-chrome.mjs still src/remotion/index.ts CodexWorkflow --frame=30 --scale=0.25 --output=artifacts/remotion-codex-workflow.png",
+    "remotion:render": "node scripts/remotion-with-local-chrome.mjs render src/remotion/index.ts CodexWorkflow artifacts/remotion-codex-workflow.mp4",
+    "production:still": "node scripts/remotion-with-local-chrome.mjs still src/remotion/index.ts LightweightProductionWorkflow --frame=180 --scale=0.25 --output=artifacts/lightweight-production-workflow.png",
+    "production:render": "node scripts/remotion-with-local-chrome.mjs render src/remotion/index.ts LightweightProductionWorkflow artifacts/lightweight-production-workflow.mp4",
+    "heygen:sample:still": "node scripts/remotion-with-local-chrome.mjs still src/remotion/index.ts HeyGenProductionWorkflowSample --frame=120 --scale=0.25 --output=artifacts/heygen-production-workflow-sample.png",
+    "heygen:sample:render": "node scripts/remotion-with-local-chrome.mjs render src/remotion/index.ts HeyGenProductionWorkflowSample artifacts/heygen-production-workflow-sample.mp4",
+    "heygen:trend:still": "node scripts/remotion-with-local-chrome.mjs still src/remotion/index.ts HeyGenLightweightTrendVideo --frame=360 --scale=0.35 --output=artifacts/heygen-lightweight-trend-video.png",
+    "heygen:trend:render": "node scripts/remotion-with-local-chrome.mjs render src/remotion/index.ts HeyGenLightweightTrendVideo artifacts/heygen-lightweight-trend-video.mp4",
+    "workflow:check": "npm.cmd run hf:lint && npm.cmd run remotion:still && npm.cmd run build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "config": {
+    "electron_builder_binaries_mirror": "https://npmmirror.com/mirrors/electron-builder-binaries/"
+  },
+  "build": {
+    "appId": "com.aicatalog.agent",
+    "productName": "AI Catalog Agent",
+    "compression": "normal",
+    "directories": {
+      "output": "release"
+    },
+    "toolsets": {
+      "winCodeSign": "1.1.0"
+    },
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "scripts/agent-runner.mjs",
+      "scripts/agent-core.mjs",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "AI-Catalog-Agent-Setup-${version}.${ext}",
+      "signAndEditExecutable": false,
+      "signtoolOptions": {
+        "sign": null
+      }
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "type": "module",
+  "dependencies": {
+    "lucide-react": "^1.14.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
+    "@remotion/bundler": "^4.0.463",
+    "@remotion/cli": "^4.0.463",
+    "@remotion/media-utils": "^4.0.463",
+    "@remotion/player": "^4.0.463",
+    "@remotion/renderer": "^4.0.463",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.5.0",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^42.2.0",
+    "electron-builder": "^26.8.1",
+    "gsap": "^3.15.0",
+    "hyperframes": "^0.6.25",
+    "postcss": "^8.5.14",
+    "remotion": "^4.0.463",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.12",
+    "wait-on": "^9.0.10"
+  }
+}
