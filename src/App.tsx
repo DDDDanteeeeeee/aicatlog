@@ -9,21 +9,23 @@ import {
   FileOutput,
   FileText,
   FolderOpen,
-  KeyRound,
+  Languages,
+  ListFilter,
   Loader2,
   Lock,
   MonitorCheck,
+  Plus,
   Play,
-  Server,
   ShieldCheck,
   TerminalSquare,
+  Trash2,
   UnlockKeyhole,
   X,
 } from 'lucide-react';
 
 type CheckStatus = 'pending' | 'running' | 'passed' | 'warning' | 'failed';
 type JobStatus = 'idle' | 'running' | 'done';
-type ModalName = 'activation' | 'model' | null;
+type ModalName = 'activation' | 'points' | null;
 
 type TaskProgress = {
   stage: string;
@@ -46,14 +48,8 @@ type AccountState = {
   plan?: string;
   planLabel?: string;
   expiresAt?: string | null;
+  pointsBalance?: number;
   lastVerifiedAt?: string;
-};
-
-type ModelConfig = {
-  provider: string;
-  endpoint: string;
-  model: string;
-  apiKey: string;
 };
 
 type TaskState = {
@@ -63,9 +59,26 @@ type TaskState = {
   outputCustomPath: string;
   sourceLang: string;
   targetLang: string;
+  translationRules: TranslationRule[];
   fontPath: string;
   fontName: string;
   glossary: string;
+};
+
+type DetectedTextGroup = {
+  id: string;
+  label: string;
+  detail: string;
+  textFrames: number;
+  characters: number;
+  samples: string[];
+  recommendation?: string;
+};
+
+type TranslationRule = {
+  id: string;
+  source: string;
+  target: string;
 };
 
 type CurrentTaskContext = {
@@ -77,10 +90,8 @@ type CurrentTaskContext = {
 
 type AgentConfig = {
   account?: AccountState;
-  modelConfig?: ModelConfig;
   task?: TaskState;
   licensed?: boolean;
-  modelConnected?: boolean;
 };
 
 type TaskResult = {
@@ -111,7 +122,19 @@ type LicenseResponse = {
   plan?: string;
   planLabel?: string;
   expiresAt?: string | null;
+  pointsBalance?: number;
+  redeemedPoints?: number;
+  consumedPoints?: number;
+  refundedPoints?: number;
+  requiredPoints?: number;
   reason?: string;
+};
+
+type FileInfoResponse = {
+  ok: boolean;
+  path?: string;
+  size?: number;
+  message?: string;
 };
 
 type AgentBridge = {
@@ -119,9 +142,11 @@ type AgentBridge = {
   saveConfig: (config: AgentConfig) => Promise<AgentConfig>;
   selectAiFile: () => Promise<string | null>;
   selectFontFile: () => Promise<string | null>;
+  getFileInfo: (path: string) => Promise<FileInfoResponse>;
   runSystemCheck: () => Promise<Array<{ id: string; status: CheckStatus; detail?: string }>>;
   verifyLicense: (payload: AccountState & { verifyOnly?: boolean }) => Promise<LicenseResponse>;
-  runTask: (payload: TaskState & { selectedFile: string; modelConfig: ModelConfig; currentTask?: CurrentTaskContext | null }) => Promise<TaskResult>;
+  redeemPoints: (payload: AccountState & { redeemCode: string }) => Promise<LicenseResponse>;
+  runTask: (payload: TaskState & { selectedFile: string; account: AccountState; requiredPoints: number; currentTask?: CurrentTaskContext | null }) => Promise<TaskResult>;
   onTaskProgress?: (callback: (progress: TaskProgress) => void) => () => void;
   openPath: (path: string) => Promise<boolean>;
   revealPath: (path: string) => Promise<boolean>;
@@ -133,16 +158,34 @@ declare global {
   }
 }
 
-const providerPresets = [
-  { provider: 'OpenAI Compatible', endpoint: 'https://api.openai.com/v1', model: 'gpt-4.1-mini' },
-  { provider: 'DeepSeek', endpoint: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
-  { provider: '通义千问', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
-  { provider: '智谱 GLM', endpoint: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
-  { provider: '自定义兼容接口', endpoint: '', model: '' },
-];
-const providers = providerPresets.map((item) => item.provider);
 const targetLanguages = ['简体中文', '繁体中文', '英语', '日语', '韩语', '法语', '德语', '西班牙语', '葡萄牙语', '意大利语', '俄语', '阿拉伯语'];
 const outputLocations = ['源文件同目录', '桌面', '文档目录', '自定义路径'];
+const defaultTranslationScope = '全部可翻译文字';
+const detectedTextGroups: DetectedTextGroup[] = [
+  {
+    id: 'zh-Hans',
+    label: '简体中文',
+    detail: '检测到产品说明、参数描述和标题中的简体中文内容',
+    textFrames: 49,
+    characters: 1860,
+    samples: ['生产线对工作环境的要求', '设备用途', '海缆生产线'],
+    recommendation: '适合转换为繁体中文并保留英文原文',
+  },
+  {
+    id: 'en',
+    label: '英文',
+    detail: '检测到英文产品名称、说明和型号相关内容',
+    textFrames: 42,
+    characters: 2140,
+    samples: ['Equipment Application', 'Power supply', 'Submarine cable production line'],
+  },
+];
+const mixedTextNotice = {
+  textFrames: 18,
+  samples: ['◎海缆生产线 Submarine cable production line', '150+90+45海缆复合挤出生产线'],
+};
+const baseTranslationScopes = ['简体中文', '繁体中文', '英文', '日文', '韩文'];
+const initialTranslationRules: TranslationRule[] = [{ id: 'rule-default', source: '简体中文', target: '繁体中文' }];
 const storageKey = 'ai-catalog-agent-config';
 const acceptedExtensions = '.ai';
 const defaultLicenseEndpoint = import.meta.env.VITE_LICENSE_ENDPOINT || 'http://127.0.0.1:8787/api/license/activate';
@@ -151,8 +194,9 @@ const initialTaskState: TaskState = {
   outputName: '',
   outputLocation: '源文件同目录',
   outputCustomPath: '',
-  sourceLang: '英文',
+  sourceLang: defaultTranslationScope,
   targetLang: '简体中文',
+  translationRules: initialTranslationRules,
   fontPath: '',
   fontName: '',
   glossary: '',
@@ -182,6 +226,9 @@ const fallbackBridge: AgentBridge = {
   async selectFontFile() {
     return null;
   },
+  async getFileInfo() {
+    return { ok: false, size: 0 };
+  },
   async runSystemCheck() {
     await delay(500);
     return initialChecks.map((item) => ({
@@ -198,6 +245,16 @@ const fallbackBridge: AgentBridge = {
       planLabel: '永久买断',
       expiresAt: null,
       licenseToken: 'preview-token',
+      pointsBalance: 120,
+    };
+  },
+  async redeemPoints(payload) {
+    await delay(500);
+    return {
+      ok: Boolean(payload.redeemCode.trim()),
+      message: '预览模式：点数码已兑换。',
+      redeemedPoints: 50,
+      pointsBalance: Number(payload.pointsBalance || 0) + 50,
     };
   },
   async runTask(payload) {
@@ -234,17 +291,12 @@ export default function App() {
     activationCode: '',
     licenseEndpoint: defaultLicenseEndpoint,
   });
+  const [redeemCode, setRedeemCode] = useState('');
   const [checks, setChecks] = useState(initialChecks);
   const [isChecking, setIsChecking] = useState(false);
-  const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: providers[0],
-    endpoint: 'https://api.openai.com/v1',
-    model: 'gpt-4.1-mini',
-    apiKey: '',
-  });
-  const [modelConnected, setModelConnected] = useState(false);
   const [task, setTask] = useState<TaskState>(initialTaskState);
   const [selectedFile, setSelectedFile] = useState('');
+  const [sourceFileSize, setSourceFileSize] = useState(0);
   const [currentTask, setCurrentTask] = useState<CurrentTaskContext | null>(null);
   const [jobStatus, setJobStatus] = useState<JobStatus>('idle');
   const [progress, setProgress] = useState(0);
@@ -259,7 +311,16 @@ export default function App() {
   }, [selectedFile, task.sourcePath]);
   const outputName = task.outputName || (sourceName ? withChineseSuffix(sourceName) : '');
   const taskReady = Boolean(task.sourcePath || selectedFile);
+  const translationRules = task.translationRules?.length ? task.translationRules : initialTranslationRules;
+  const detectedGroups = taskReady ? detectedTextGroups : [];
+  const translationScopeOptions = useMemo(() => {
+    const detectedLabels = detectedGroups.map((group) => group.label);
+    return [...new Set([...baseTranslationScopes, ...detectedLabels])];
+  }, [detectedGroups]);
+  const maxTranslationRules = taskReady ? Math.max(1, detectedGroups.length) : translationScopeOptions.length;
+  const canAddTranslationRule = translationRules.length < maxTranslationRules;
   const failureMessage = !result?.ok ? result?.stderr || result?.message || '' : '';
+  const requiredPoints = estimateTaskPoints({ taskReady, fileSize: sourceFileSize, rules: translationRules, detectedGroups });
   const canResumeCurrentTask = currentTask?.status === 'failed' && taskReady;
   const primaryActionLabel = getPrimaryActionLabel({ jobStatus, currentTaskStatus: currentTask?.status });
 
@@ -270,7 +331,6 @@ export default function App() {
         loadedAccount = { ...config.account, activationCode: config.account.activationCode || '', licenseEndpoint: config.account.licenseEndpoint || defaultLicenseEndpoint };
         setAccount(loadedAccount);
       }
-      if (config.modelConfig) setModelConfig((current) => ({ ...current, ...config.modelConfig }));
       if (config.task) {
         const savedTask = normalizeTaskConfig({ ...initialTaskState, ...config.task });
         setTask({ ...savedTask, sourcePath: '', outputName: '' });
@@ -298,7 +358,6 @@ export default function App() {
           })
           .finally(() => setIsLicenseChecking(false));
       }
-      if (config.modelConnected) setModelConnected(true);
     });
   }, []);
 
@@ -333,6 +392,7 @@ export default function App() {
               plan: '',
               planLabel: '',
               expiresAt: undefined,
+              pointsBalance: undefined,
               lastVerifiedAt: undefined,
             }
           : { ...current, [field]: value };
@@ -342,24 +402,33 @@ export default function App() {
     });
   };
 
-  const updateModel = (field: keyof ModelConfig, value: string) => {
-    setModelConnected(false);
-    setModelConfig((current) => {
-      const preset = field === 'provider' ? providerPresets.find((item) => item.provider === value) : null;
-      const next = preset
-        ? { ...current, provider: preset.provider, endpoint: preset.endpoint, model: preset.model }
-        : { ...current, [field]: value };
-      persist({ modelConfig: next, modelConnected: false });
-      return next;
-    });
-  };
-
-  const updateTask = (field: keyof TaskState, value: string) => {
+  const updateTask = <K extends keyof TaskState>(field: K, value: TaskState[K]) => {
     setTask((current) => {
       const next = { ...current, [field]: value };
       persist({ task: next });
       return next;
     });
+  };
+
+  const addTranslationRule = () => {
+    if (!canAddTranslationRule) return;
+    const usedSources = new Set(translationRules.map((rule) => rule.source));
+    const nextSource = translationScopeOptions.find((option) => !usedSources.has(option)) || translationScopeOptions[0] || '简体中文';
+    updateTask('translationRules', [...translationRules, { id: createTaskId(), source: nextSource, target: task.targetLang || '简体中文' }]);
+  };
+
+  const updateTranslationRule = (id: string, field: 'source' | 'target', value: string) => {
+    updateTask('translationRules', translationRules.map((rule) => (rule.id === id ? { ...rule, [field]: value } : rule)));
+  };
+
+  const removeTranslationRule = (id: string) => {
+    if (translationRules.length <= 1) return;
+    updateTask('translationRules', translationRules.filter((rule) => rule.id !== id));
+  };
+
+  const getRuleSourceOptions = (ruleId: string) => {
+    const usedByOtherRules = new Set(translationRules.filter((rule) => rule.id !== ruleId).map((rule) => rule.source));
+    return translationScopeOptions.filter((option) => !usedByOtherRules.has(option));
   };
 
   const activateLicense = async () => {
@@ -376,14 +445,23 @@ export default function App() {
     setModal(null);
   };
 
-  const saveModelConfig = () => {
-    if (!modelConfig.apiKey.trim() || !modelConfig.model.trim() || !modelConfig.endpoint.trim()) {
-      setLogs((current) => ['模型配置失败：请填写 Endpoint、模型名称和 API Key。', ...current]);
+  const redeemPoints = async () => {
+    if (!licensed) {
+      setModal('activation');
       return;
     }
-    setModelConnected(true);
-    persist({ modelConfig, modelConnected: true });
-    setLogs((current) => [`模型配置已保存：${modelConfig.provider} / ${modelConfig.model}`, ...current]);
+    const code = redeemCode.trim();
+    if (!code) return;
+    const response = await bridge.redeemPoints({ ...account, redeemCode: code });
+    if (!response.ok) {
+      setLogs((current) => [formatPointsFailure(response), ...current]);
+      return;
+    }
+    const nextAccount = mergeLicenseResponse(account, response);
+    setAccount(nextAccount);
+    persist({ account: nextAccount, licensed: true });
+    setRedeemCode('');
+    setLogs((current) => [`点数码兑换成功：+${response.redeemedPoints || 0} 点，当前余额 ${formatPointsBalance(nextAccount)}。`, ...current].slice(0, 80));
     setModal(null);
   };
 
@@ -401,14 +479,26 @@ export default function App() {
     setLogs((current) => ['执行检测完成。', ...current]);
   };
 
+  const refreshAccountState = async (baseAccount: AccountState) => {
+    const response = await bridge.verifyLicense({ ...baseAccount, verifyOnly: true });
+    if (!response.ok) return baseAccount;
+    const nextAccount = mergeLicenseResponse(baseAccount, response);
+    setAccount(nextAccount);
+    persist({ account: nextAccount, licensed: true });
+    return nextAccount;
+  };
+
   const chooseFile = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
     setSelectedFile(file.name);
+    setSourceFileSize(file.size || 0);
     setCurrentTask({ taskId: createTaskId(), sourcePath: file.name, status: 'idle' });
     setTaskProgress(null);
     setResult(null);
     setProgress(0);
+    updateTask('sourceLang', defaultTranslationScope);
+    updateTask('translationRules', initialTranslationRules);
     updateTask('outputName', withChineseSuffix(file.name));
     setLogs((current) => [`已选择文件：${file.name}`, ...current]);
   };
@@ -423,10 +513,14 @@ export default function App() {
     updateTask('sourcePath', path);
     const fileName = path.split(/[\\/]/).pop() || 'catalog.ai';
     setSelectedFile('');
+    const fileInfo = await bridge.getFileInfo(path);
+    setSourceFileSize(fileInfo.ok ? Number(fileInfo.size || 0) : 0);
     setCurrentTask({ taskId: createTaskId(), sourcePath: path, status: 'idle' });
     setTaskProgress(null);
     setResult(null);
     setProgress(0);
+    updateTask('sourceLang', defaultTranslationScope);
+    updateTask('translationRules', initialTranslationRules);
     updateTask('outputName', withChineseSuffix(fileName));
     setLogs((current) => [`已选择文件：${path}`, ...current]);
   };
@@ -460,6 +554,7 @@ export default function App() {
       return;
     }
     setSelectedFile('');
+    setSourceFileSize(0);
     setCurrentTask(null);
     setTask(initialTaskState);
     setTaskProgress(null);
@@ -475,10 +570,6 @@ export default function App() {
       setModal('activation');
       return;
     }
-    if (!modelConnected) {
-      setModal('model');
-      return;
-    }
     if (!envReady) {
       await runEnvironmentCheck();
       return;
@@ -492,20 +583,39 @@ export default function App() {
       currentTask && currentTask.sourcePath === (task.sourcePath || selectedFile)
         ? currentTask
         : { taskId: createTaskId(), sourcePath: task.sourcePath || selectedFile, status: 'idle' as const };
+    const pointsBalance = Number(account.pointsBalance || 0);
+    if (pointsBalance < requiredPoints) {
+      setLogs((current) => [`点数余额不足，本次任务预计需要 ${requiredPoints} 点。请先兑换点数码。`, ...current].slice(0, 80));
+      setModal('points');
+      return;
+    }
+    if (!window.confirm(`本次任务预计消耗 ${requiredPoints} 点。确认开始处理吗？`)) {
+      return;
+    }
     setCurrentTask({ ...activeTask, status: 'running' });
-    const payload = { ...task, outputName, selectedFile, modelConfig, currentTask: activeTask };
+    const payload = { ...task, outputName, selectedFile, account, requiredPoints, currentTask: activeTask };
     setJobStatus('running');
     setProgress(3);
     setTaskProgress({ stage: 'queued', message: '任务已提交到本地执行器。', percent: 3 });
     setResult(null);
     setLogs([`${timestamp()} 任务已提交到本地执行器。`]);
 
-    const response = await bridge.runTask(payload);
+    let response: TaskResult;
+    try {
+      response = await bridge.runTask(payload);
+    } catch (error) {
+      response = {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
     setResult(response);
+    await refreshAccountState(account).catch(() => account);
     setProgress(response.ok ? 100 : 0);
     setJobStatus('done');
     if (!response.ok) {
       const readableError = humanizeTaskFailure(response.stderr || response.message);
+      if (isPointBalanceFailure(response.stderr || response.message)) setModal('points');
       setTaskProgress({
         stage: 'failed',
         message: '任务失败，当前任务进度已保留。重新点击继续翻译，将继续当前任务。',
@@ -555,8 +665,8 @@ export default function App() {
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
+            <StatusPill active={licensed && Number(account.pointsBalance || 0) > 0} activeText={`点数 ${formatPointsBalance(account)}`} inactiveText={licensed ? '点数 0' : '未激活'} icon={BadgeCheck} onClick={() => setModal(licensed ? 'points' : 'activation')} />
             <StatusPill active={licensed} activeText={getLicensePillText(account)} inactiveText={isLicenseChecking ? '校验中' : '未激活'} icon={licensed ? UnlockKeyhole : Lock} onClick={() => setModal('activation')} loading={isLicenseChecking} />
-            <StatusPill active={modelConnected} activeText="模型已配置" inactiveText="模型未配置" icon={Server} onClick={() => setModal('model')} />
             <StatusPill active={envReady} activeText="可执行" inactiveText="待检测" icon={MonitorCheck} onClick={runEnvironmentCheck} loading={isChecking} />
           </div>
         </div>
@@ -593,11 +703,117 @@ export default function App() {
             </div>
           </Panel>
 
+          <Panel title="文字类型与转换规则" icon={Languages}>
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+              <div className="space-y-3">
+                <div className="flex flex-col gap-2 rounded border border-slate-200 bg-slate-50 p-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-950">{taskReady ? '已完成文字类型扫描' : '等待上传文件后扫描'}</div>
+                    <div className="mt-1 text-sm text-slate-500">
+                      {taskReady ? '根据检测到的语言添加转换规则。多语种混排只作为风险提示，不作为可选范围。' : '上传 .ai 后会先读取可编辑文本，再显示检测到的文字类型。'}
+                    </div>
+                  </div>
+                  <div className="inline-flex h-9 items-center gap-2 rounded border border-slate-200 bg-white px-3 text-sm text-slate-700">
+                    <ListFilter size={16} />
+                    {taskReady ? `${detectedGroups.length} 种语言` : '未扫描'}
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  {(taskReady ? detectedGroups : detectedTextGroups).map((group) => (
+                    <div
+                      key={group.id}
+                      className={`min-h-[156px] rounded border border-slate-200 p-3 ${taskReady ? 'bg-white' : 'bg-slate-50 opacity-60'}`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-sm font-semibold text-slate-950">{group.label}</div>
+                        <div className="rounded bg-slate-100 px-2 py-1 text-xs font-medium text-slate-600">{group.textFrames} 框</div>
+                      </div>
+                      <div className="mt-2 text-xs leading-5 text-slate-500">{group.detail}</div>
+                      <div className="mt-3 space-y-1">
+                        {group.samples.slice(0, 2).map((sample) => (
+                          <div key={sample} className="truncate rounded bg-slate-50 px-2 py-1 text-xs text-slate-600">
+                            {sample}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {taskReady && (
+                  <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+                    <span className="font-semibold">检测到 {mixedTextNotice.textFrames} 个多语种混排文本框。</span>
+                    <span> AI 会自行处理这些混排内容；在下方“术语保护”中填写品牌、型号、产品名和必须保留的专业术语，可以让处理结果更准确。</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded border border-slate-200 bg-white p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-950">转换规则</div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      每条规则独立设置，最多 {maxTranslationRules} 条。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={addTranslationRule}
+                    disabled={!canAddTranslationRule}
+                    className="inline-flex h-9 items-center gap-2 rounded border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                  >
+                    <Plus size={15} />
+                    添加
+                  </button>
+                </div>
+                {!canAddTranslationRule && (
+                  <div className="mt-3 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                    已覆盖全部检测语言；如需新增规则，请先删除一条现有规则。
+                  </div>
+                )}
+
+                <div className="mt-4 space-y-3">
+                  {translationRules.map((rule, index) => (
+                    <div key={rule.id} className="rounded border border-slate-200 bg-slate-50 p-3">
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <div className="text-xs font-semibold text-slate-600">规则 {index + 1}</div>
+                        <button
+                          type="button"
+                          onClick={() => removeTranslationRule(rule.id)}
+                          disabled={translationRules.length === 1}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-40"
+                          title="删除规则"
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <SelectField label="将文件中" value={rule.source} options={getRuleSourceOptions(rule.id)} onChange={(value) => updateTranslationRule(rule.id, 'source', value)} />
+                        <SelectField label="替换为" value={rule.target} options={targetLanguages} onChange={(value) => updateTranslationRule(rule.id, 'target', value)} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="mt-4 rounded border border-emerald-200 bg-emerald-50 p-3 text-xs leading-5 text-emerald-800">
+                  <div className="font-semibold">当前规则摘要</div>
+                  <div className="mt-1 space-y-1">
+                    {translationRules.map((rule) => (
+                      <div key={`${rule.id}-summary`}>
+                        {rule.source} → {rule.target}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </Panel>
+
           <Panel title="输出设置" icon={FileOutput}>
-            <div className="grid gap-4 md:grid-cols-4">
+            <div className="grid gap-4 md:grid-cols-3">
               <Field label="输出文件名" value={outputName} onChange={(value) => updateTask('outputName', value)} placeholder="catalog_中文.ai" />
               <SelectField label="输出位置" value={task.outputLocation} options={outputLocations} onChange={(value) => updateTask('outputLocation', value)} />
-              <SelectField label="目标语言" value={task.targetLang} options={targetLanguages} onChange={(value) => updateTask('targetLang', value)} />
               <div>
                 <span className="mb-1 block text-sm font-medium text-slate-700">输出字体</span>
                 <button onClick={selectFontFile} className="inline-flex h-11 w-full items-center justify-center gap-2 rounded border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50">
@@ -646,8 +862,13 @@ export default function App() {
             <div>
               <div className="text-sm font-semibold text-slate-950">{canResumeCurrentTask ? '继续当前任务' : '开始翻译任务'}</div>
               <div className="mt-1 text-sm text-slate-500">
-                {canResumeCurrentTask ? '当前任务进度已保留，继续时会优先复用已完成翻译。' : getStartHint({ licensed, modelConnected, envReady, taskReady })}
+                {canResumeCurrentTask ? '当前任务进度已保留，继续时会优先复用已完成翻译。' : getStartHint({ licensed, envReady, taskReady })}
               </div>
+              {taskReady && (
+                <div className="mt-2 text-xs text-slate-500">
+                  预计消耗 <span className="font-semibold text-slate-950">{requiredPoints}</span> 点，当前余额 <span className="font-semibold text-slate-950">{formatPointsBalance(account)}</span> 点。
+                </div>
+              )}
             </div>
             <button onClick={startRun} disabled={jobStatus === 'running'} className="inline-flex h-12 items-center justify-center gap-2 rounded bg-emerald-600 px-6 text-sm font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300">
               {jobStatus === 'running' ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} />}
@@ -731,23 +952,16 @@ export default function App() {
         </Modal>
       )}
 
-      {modal === 'model' && (
-        <Modal title="模型配置" icon={KeyRound} onClose={() => setModal(null)}>
-          <div className="grid gap-4">
-            <label className="block">
-              <span className="mb-1 block text-sm font-medium text-slate-700">服务商</span>
-              <select value={modelConfig.provider} onChange={(event) => updateModel('provider', event.target.value)} className="h-11 w-full rounded border border-slate-300 bg-white px-3 text-sm outline-none focus:border-slate-950">
-                {providers.map((provider) => (
-                  <option key={provider}>{provider}</option>
-                ))}
-              </select>
-            </label>
-            <Field label="API Endpoint" value={modelConfig.endpoint} onChange={(value) => updateModel('endpoint', value)} placeholder="https://api.example.com/v1" />
-            <Field label="模型名称" value={modelConfig.model} onChange={(value) => updateModel('model', value)} placeholder="qwen-plus" />
-            <Field label="API Key" type="password" value={modelConfig.apiKey} onChange={(value) => updateModel('apiKey', value)} placeholder="sk-..." />
+      {modal === 'points' && (
+        <Modal title="兑换点数码" icon={BadgeCheck} onClose={() => setModal(null)}>
+          <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-700">
+            当前点数余额：<span className="font-semibold text-slate-950">{formatPointsBalance(account)}</span>
           </div>
-          <p className="mt-3 text-sm text-slate-500">API Key 仅保存在本机，用于调用用户自己的模型服务。</p>
-          <ModalActions primaryLabel="保存配置" onPrimary={saveModelConfig} disabled={!modelConfig.endpoint || !modelConfig.model || !modelConfig.apiKey} />
+          <div className="mt-4">
+            <Field label="点数码" value={redeemCode} onChange={setRedeemCode} placeholder="输入购买后收到的点数码" />
+          </div>
+          <p className="mt-3 text-sm text-slate-500">点数码会绑定到当前已激活设备，用于后续文件处理任务扣点。</p>
+          <ModalActions primaryLabel="兑换点数" onPrimary={redeemPoints} disabled={!licensed || !redeemCode.trim()} />
         </Modal>
       )}
 
@@ -850,9 +1064,8 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function getStartHint({ licensed, modelConnected, envReady, taskReady }: { licensed: boolean; modelConnected: boolean; envReady: boolean; taskReady: boolean }) {
+function getStartHint({ licensed, envReady, taskReady }: { licensed: boolean; envReady: boolean; taskReady: boolean }) {
   if (!licensed) return '点击开始后会先要求输入激活码。';
-  if (!modelConnected) return '点击开始后会先要求填写模型 API 配置。';
   if (!envReady) return '点击开始后会先执行本机能力检测。';
   if (!taskReady) return '请选择一个 Illustrator .ai 源文件。';
   return '条件已满足，可以开始翻译。';
@@ -866,8 +1079,21 @@ function mergeLicenseResponse(account: AccountState, response: LicenseResponse):
     plan: response.plan || account.plan,
     planLabel: response.planLabel || account.planLabel,
     expiresAt: response.expiresAt === undefined ? account.expiresAt : response.expiresAt,
+    pointsBalance: response.pointsBalance === undefined ? account.pointsBalance : response.pointsBalance,
     lastVerifiedAt: new Date().toISOString(),
   };
+}
+
+function formatPointsBalance(account: AccountState) {
+  return String(Math.max(0, Number(account.pointsBalance || 0)));
+}
+
+function estimateTaskPoints({ taskReady, fileSize, rules, detectedGroups }: { taskReady: boolean; fileSize: number; rules: TranslationRule[]; detectedGroups: DetectedTextGroup[] }) {
+  if (!taskReady) return 0;
+  const detectedCharacters = detectedGroups.reduce((total, group) => total + group.characters, 0);
+  const fileWeight = Math.ceil(Math.max(0, Number(fileSize || 0)) / (18 * 1024 * 1024));
+  const textWeight = Math.ceil((detectedCharacters * Math.max(1, rules.length)) / 5000);
+  return Math.max(1, fileWeight, textWeight);
 }
 
 function getLicensePillText(account: AccountState) {
@@ -903,6 +1129,14 @@ function formatLicenseFailure(response: LicenseResponse) {
   return response.message || '授权校验失败，请重新激活或联系售后。';
 }
 
+function formatPointsFailure(response: LicenseResponse) {
+  if (response.reason === 'LICENSE_NOT_FOUND') return '请先完成激活，再兑换点数码。';
+  if (response.reason === 'CODE_REDEEMED') return '该点数码已被使用。';
+  if (response.reason === 'CODE_EXPIRED') return '该点数码已过期。';
+  if (response.reason === 'NO_POINTS') return '该兑换码不包含可用点数。';
+  return response.message || '点数码兑换失败，请检查后重新输入。';
+}
+
 function getPrimaryActionLabel({ jobStatus, currentTaskStatus }: { jobStatus: JobStatus; currentTaskStatus?: CurrentTaskContext['status'] }) {
   if (jobStatus === 'running') return '正在执行';
   if (currentTaskStatus === 'failed') return '继续翻译';
@@ -912,15 +1146,18 @@ function getPrimaryActionLabel({ jobStatus, currentTaskStatus }: { jobStatus: Jo
 
 function humanizeTaskFailure(message = '') {
   const text = String(message || '').trim();
-  if (!text) return '任务未完成，请检查文件、模型配置或网络状态。';
+  if (!text) return '任务未完成，请检查文件、服务状态或网络状态。';
+  if (isPointBalanceFailure(text)) {
+    return '点数余额不足，请先兑换点数码后继续当前任务。';
+  }
   if (/API Key|apiKey|401|403|unauthorized|forbidden/i.test(text)) {
-    return '模型服务鉴权失败，请检查 API Key 是否正确或是否仍可用。';
+    return '模型服务暂时不可用，请联系维护者检查服务配置后继续当前任务。';
   }
   if (/timeout|超时|AbortError/i.test(text)) {
     return '模型服务响应超时，请检查网络后直接继续当前任务。';
   }
   if (/quota|余额|insufficient|limit|429/i.test(text)) {
-    return '模型服务额度不足或请求过于频繁，请处理账号额度后继续当前任务。';
+    return '模型服务繁忙或额度不足，请稍后继续当前任务；如果反复出现，请联系维护者。';
   }
   if (/Illustrator|ComObject|DoJavaScript|无法.*Illustrator/i.test(text)) {
     return 'Illustrator 执行失败，请确认 Illustrator 已正确安装并可正常打开该文件。';
@@ -929,6 +1166,10 @@ function humanizeTaskFailure(message = '') {
     return '模型服务返回异常，请稍后直接继续当前任务。';
   }
   return text.length > 180 ? `${text.slice(0, 180)}...` : text;
+}
+
+function isPointBalanceFailure(message = '') {
+  return /INSUFFICIENT_POINTS|点数余额不足|pointsBalance|requiredPoints/i.test(String(message || ''));
 }
 
 function withChineseSuffix(fileName: string) {
@@ -956,9 +1197,27 @@ function normalizeTaskConfig(task: TaskState): TaskState {
     ...task,
     outputName,
     outputLocation: outputLocations.includes(task.outputLocation) ? task.outputLocation : '源文件同目录',
-    sourceLang: hasMojibake(task.sourceLang) || !task.sourceLang ? '英文' : task.sourceLang,
+    sourceLang: hasMojibake(task.sourceLang) || !task.sourceLang ? defaultTranslationScope : task.sourceLang,
     targetLang: targetLanguages.includes(task.targetLang) ? task.targetLang : '简体中文',
+    translationRules: normalizeTranslationRules(task.translationRules),
   };
+}
+
+function normalizeTranslationRules(rules: TranslationRule[] | undefined): TranslationRule[] {
+  if (!Array.isArray(rules) || rules.length === 0) return initialTranslationRules;
+  const usedSources = new Set<string>();
+  const normalized = rules
+    .map((rule, index) => ({
+      id: rule.id || `rule-${index + 1}`,
+      source: baseTranslationScopes.includes(rule.source) ? rule.source : initialTranslationRules[0].source,
+      target: targetLanguages.includes(rule.target) ? rule.target : initialTranslationRules[0].target,
+    }))
+    .filter((rule) => {
+      if (usedSources.has(rule.source)) return false;
+      usedSources.add(rule.source);
+      return true;
+    });
+  return normalized.length ? normalized : initialTranslationRules;
 }
 
 function hasMojibake(value: string) {

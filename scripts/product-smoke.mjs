@@ -43,6 +43,12 @@ await check('packaged app contains font upload bridge', async () => {
   assert.equal(content.includes(Buffer.from('select-font-file')), true);
 });
 
+await check('packaged app contains source-language rule filtering', async () => {
+  const content = await readFile(unpackedAsarPath);
+  assert.equal(content.includes(Buffer.from('shouldTranslateTextForRules')), true);
+  assert.equal(content.includes(Buffer.from('Translate only matching source-language segments')), true);
+});
+
 await check('license plans and latest-device rule work locally', () => {
   const store = createEmptyStore();
   const monthly = addActivationCode(store, { plan: 'monthly' });

@@ -19,6 +19,7 @@ if (command === 'create') {
     plan: resolvePlanArg(),
     expiresAt: getOptionalArg('--expires-at'),
     note: getArg('--note') || '',
+    points: Number(getArg('--points') || 0),
   });
   await saveStore(storePath, store);
   console.log(code.displayCode);
@@ -33,7 +34,7 @@ if (command === 'create') {
   await saveStore(storePath, store);
   console.log(JSON.stringify(result, null, 2));
 } else {
-  console.log('Usage: node scripts/license-admin.mjs create|list|disable <code>|reset-device <code>');
+  console.log('Usage: node scripts/license-admin.mjs create [plan] [--points N] [--note text]|list|disable <code>|reset-device <code>');
   process.exit(command ? 1 : 0);
 }
 

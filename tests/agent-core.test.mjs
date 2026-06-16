@@ -8,10 +8,13 @@ import {
   buildExtractJsx,
   buildTranslationRequest,
   buildTranslationsPayload,
+  estimateTranslationPointsForFrames,
   normalizeChatCompletionsEndpoint,
+  normalizeTranslationRules,
   parseModelJsonContent,
   parseGlossary,
   resolveOutputDirectory,
+  shouldTranslateTextForRules,
   translateFrames,
   toJsString,
 } from '../scripts/agent-core.mjs';
@@ -54,6 +57,77 @@ test('buildTranslationRequest creates strict JSON chat request', () => {
   assert.match(request.body.messages[1].content, /Professional video encoder/);
 });
 
+test('buildTranslationRequest defaults to automatic source-language detection', () => {
+  const request = buildTranslationRequest({
+    frames: [{ index: 7, text: 'Production line' }],
+    glossary: '',
+    targetLang: 'Traditional Chinese',
+    modelConfig: {
+      endpoint: 'https://api.example.com/v1',
+      model: 'qwen-plus',
+    },
+  });
+  const userPayload = JSON.parse(request.body.messages[1].content);
+
+  assert.equal(userPayload.sourceLanguage, 'Auto-detect from each text frame');
+  assert.equal(userPayload.targetLanguage, 'Traditional Chinese');
+  assert.deepEqual(userPayload.translationRules, [
+    { sourceLanguage: 'Auto-detect from each text frame', targetLanguage: 'Traditional Chinese' },
+  ]);
+});
+
+test('buildTranslationRequest includes independent translation rules', () => {
+  const request = buildTranslationRequest({
+    frames: [{ index: 9, text: '生产线 Production line' }],
+    glossary: '',
+    translationRules: [
+      { source: '简体中文', target: '日语' },
+      { source: '英文', target: '德语' },
+    ],
+    modelConfig: {
+      endpoint: 'https://api.example.com/v1',
+      model: 'qwen-plus',
+    },
+  });
+  const userPayload = JSON.parse(request.body.messages[1].content);
+
+  assert.deepEqual(userPayload.translationRules, [
+    { sourceLanguage: '简体中文', targetLanguage: '日语' },
+    { sourceLanguage: '英文', targetLanguage: '德语' },
+  ]);
+  assert.match(request.body.messages[0].content, /hard constraints/);
+  assert.match(request.body.messages[0].content, /copy it exactly/);
+});
+
+test('normalizeTranslationRules falls back to legacy source and target language', () => {
+  assert.deepEqual(normalizeTranslationRules({ sourceLang: 'English', targetLang: '简体中文' }), [
+    { sourceLanguage: 'English', targetLanguage: '简体中文' },
+  ]);
+});
+
+test('estimateTranslationPointsForFrames keeps one cloud task charge across batches', () => {
+  const points = estimateTranslationPointsForFrames({
+    frames: [
+      { index: 1, text: 'a'.repeat(3200) },
+      { index: 2, text: 'b'.repeat(3200) },
+    ],
+    translationRules: [
+      { source: 'Chinese', target: 'Japanese' },
+      { source: 'English', target: 'German' },
+    ],
+    fallbackPoints: 1,
+  });
+
+  assert.equal(points, 3);
+});
+
+test('shouldTranslateTextForRules skips non-source-language frames', () => {
+  const rules = [{ source: 'Simplified Chinese', target: 'German' }];
+
+  assert.equal(shouldTranslateTextForRules('Serve Customers', rules), false);
+  assert.equal(shouldTranslateTextForRules('\u751f\u4ea7\u7ebf Production line', rules), true);
+});
+
 test('buildTranslationsPayload emits Illustrator-readable payload', () => {
   const payload = buildTranslationsPayload([{ index: 2, original: 'Hello', translated: '你好' }]);
   assert.match(payload, /frameTranslations/);
@@ -82,8 +156,11 @@ test('build JSX scripts include configured paths', () => {
 
   assert.match(extract, /C:\/tmp\/source.ai/);
   assert.match(extract, /C:\/tmp\/extracted.json/);
+  assert.match(extract, /hasTranslatableText/);
+  assert.doesNotMatch(extract, /hasLatinText/);
   assert.match(apply, /C:\/tmp\/output.ai/);
   assert.match(apply, /MicrosoftYaHei/);
+  assert.match(apply, /DONTDISPLAYALERTS/);
 });
 
 test('build apply JSX can prefer a user supplied font', () => {
@@ -209,6 +286,99 @@ test('translateFrames retries transient model failures', async () => {
 
   assert.equal(calls, 2);
   assert.equal(translations[0].translated, '你好');
+  globalThis.fetch = originalFetch;
+});
+
+test('translateFrames uses cloud proxy without model authorization header', async () => {
+  const originalFetch = globalThis.fetch;
+  let requestUrl = '';
+  let requestInit = null;
+  let requestPayload = null;
+  globalThis.fetch = async (url, init) => {
+    requestUrl = String(url);
+    requestInit = init;
+    requestPayload = JSON.parse(String(init.body || '{}'));
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        translations: [{ index: 4, translated: 'クラウド翻訳' }],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  };
+
+  const translations = await translateFrames({
+    frames: [{ index: 4, text: 'Cloud translation' }],
+    modelConfig: {
+      mode: 'cloud-proxy',
+      provider: 'AI Catalog Cloud',
+      endpoint: 'http://127.0.0.1:8787/api/translate/batch',
+      model: 'cloud-managed',
+      licenseToken: 'license-token',
+      activationCode: 'ACTIVATION-CODE',
+      deviceId: 'device-a',
+      taskId: 'task-cloud',
+      points: 3,
+    },
+    glossary: 'NDI = NDI',
+    sourceLang: 'English',
+    targetLang: 'Japanese',
+    retryDelayMs: 1,
+  });
+
+  assert.equal(requestUrl, 'http://127.0.0.1:8787/api/translate/batch');
+  assert.equal(requestInit.headers.authorization, undefined);
+  assert.equal(requestPayload.licenseToken, 'license-token');
+  assert.equal(requestPayload.activationCode, 'ACTIVATION-CODE');
+  assert.equal(requestPayload.deviceId, 'device-a');
+  assert.equal(requestPayload.taskId, 'task-cloud');
+  assert.equal(requestPayload.points, 3);
+  assert.deepEqual(requestPayload.frames, [{ index: 4, text: 'Cloud translation' }]);
+  assert.equal(translations[0].translated, 'クラウド翻訳');
+  globalThis.fetch = originalFetch;
+});
+
+test('translateFrames leaves nonmatching frames unchanged before cloud proxy', async () => {
+  const originalFetch = globalThis.fetch;
+  let requestPayload = null;
+  globalThis.fetch = async (_url, init) => {
+    requestPayload = JSON.parse(String(init.body || '{}'));
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        translations: [{ index: 2, translated: 'Produktionslinie Production line' }],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  };
+
+  const translations = await translateFrames({
+    frames: [
+      { index: 1, text: 'Serve Customers' },
+      { index: 2, text: '\u751f\u4ea7\u7ebf Production line' },
+    ],
+    modelConfig: {
+      mode: 'cloud-proxy',
+      provider: 'AI Catalog Cloud',
+      endpoint: 'http://127.0.0.1:8787/api/translate/batch',
+      model: 'cloud-managed',
+      licenseToken: 'license-token',
+      activationCode: 'ACTIVATION-CODE',
+      deviceId: 'device-a',
+      taskId: 'task-cloud',
+      points: 1,
+    },
+    glossary: '',
+    sourceLang: 'Simplified Chinese',
+    targetLang: 'German',
+    translationRules: [{ source: 'Simplified Chinese', target: 'German' }],
+    retryDelayMs: 1,
+  });
+
+  assert.deepEqual(requestPayload.frames, [{ index: 2, text: '\u751f\u4ea7\u7ebf Production line' }]);
+  assert.equal(translations[0].translated, 'Serve Customers');
+  assert.equal(translations[1].translated, 'Produktionslinie Production line');
+  assert.equal(translations.stats.ruleSkips, 1);
   globalThis.fetch = originalFetch;
 });
 

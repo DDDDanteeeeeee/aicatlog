@@ -1,6 +1,6 @@
 {
   "name": "ai-catalog-agent",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Local control shell for editable Illustrator catalog translation",
   "private": true,
   "main": "electron/main.cjs",

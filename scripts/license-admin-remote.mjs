@@ -13,6 +13,7 @@ if (command === 'create') {
     plan: resolvePlanArg(),
     expiresAt: getOptionalArg('--expires-at'),
     note: getArg('--note') || '',
+    points: Number(getArg('--points') || 0),
   };
   const result = await request('/admin/codes', { method: 'POST', body: payload });
   console.log(result.activationCode || JSON.stringify(result, null, 2));
@@ -26,7 +27,7 @@ if (command === 'create') {
   const result = await request('/admin/codes/reset-device', { method: 'POST', body: { activationCode: arg } });
   console.log(JSON.stringify(result, null, 2));
 } else {
-  console.log('Usage: node scripts/license-admin-remote.mjs create [monthly|yearly|lifetime]|list|disable <code>|reset-device <code>');
+  console.log('Usage: node scripts/license-admin-remote.mjs create [monthly|yearly|lifetime] [--points N] [--note text]|list|disable <code>|reset-device <code>');
   process.exit(command ? 1 : 0);
 }
 

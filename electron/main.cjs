@@ -1,7 +1,7 @@
 const { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+const { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } = require('node:fs');
 const { hostname, userInfo } = require('node:os');
 const { dirname, join, resolve } = require('node:path');
 const { TextDecoder } = require('node:util');
@@ -81,10 +81,46 @@ function decryptSecrets(config) {
   };
 }
 
+function redactRendererConfig(config) {
+  const { modelConfig: _modelConfig, modelConnected: _modelConnected, ...rendererConfig } = config || {};
+  return rendererConfig;
+}
+
+function sanitizeRendererConfig(config) {
+  const { modelConfig: _modelConfig, modelConnected: _modelConnected, ...rendererConfig } = config || {};
+  return rendererConfig;
+}
+
 function getDeviceId() {
   return createHash('sha256')
     .update(`${process.platform}:${process.arch}:${hostname()}:${userInfo().username}`)
     .digest('hex');
+}
+
+function buildTranslateEndpoint(licenseEndpoint) {
+  const endpoint = String(licenseEndpoint || '').trim();
+  if (!endpoint) return '';
+  return endpoint
+    .replace(/\/api\/license\/activate\/?$/, '/api/translate/batch')
+    .replace(/\/api\/license\/verify\/?$/, '/api/translate/batch')
+    .replace(/\/$/, '');
+}
+
+function resolveCloudProxyModelConfig(payload, config = readConfig()) {
+  const account = payload?.account || config.account || {};
+  const endpoint = process.env.AGENT_TRANSLATION_PROXY_ENDPOINT || process.env.TRANSLATION_PROXY_ENDPOINT || buildTranslateEndpoint(account.licenseEndpoint);
+  return {
+    mode: 'cloud-proxy',
+    provider: 'AI Catalog Cloud',
+    endpoint,
+    model: 'cloud-managed',
+    licenseToken: account.licenseToken || '',
+    activationCode: account.activationCode || '',
+    email: account.email || account.accountEmail || '',
+    deviceId: getDeviceId(),
+    taskId: payload?.currentTask?.taskId || '',
+    points: Number(payload?.requiredPoints || payload?.points || 0),
+  };
 }
 
 function createWindow() {
@@ -131,8 +167,8 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-ipcMain.handle('config:load', () => readConfig());
-ipcMain.handle('config:save', (_event, config) => saveConfig(config));
+ipcMain.handle('config:load', () => redactRendererConfig(readConfig()));
+ipcMain.handle('config:save', (_event, config) => redactRendererConfig(saveConfig(sanitizeRendererConfig(config))));
 
 ipcMain.handle('dialog:select-ai-file', async () => {
   const result = await dialog.showOpenDialog({
@@ -157,6 +193,12 @@ ipcMain.handle('dialog:select-font-file', async () => {
   });
   if (result.canceled || result.filePaths.length === 0) return null;
   return result.filePaths[0];
+});
+
+ipcMain.handle('file:info', async (_event, path) => {
+  if (!path || !existsSync(path)) return { ok: false, message: '文件不存在。' };
+  const stats = statSync(path);
+  return { ok: true, path, size: stats.size };
 });
 
 ipcMain.handle('system:check', async () => {
@@ -198,8 +240,44 @@ ipcMain.handle('license:verify', async (_event, payload) => {
   return response.json();
 });
 
+ipcMain.handle('points:redeem', async (_event, payload) => {
+  const endpoint = payload?.licenseEndpoint;
+  if (!endpoint) {
+    return { ok: false, reason: 'MISSING_LICENSE_ENDPOINT', message: '缺少授权服务地址。' };
+  }
+  const targetEndpoint = endpoint.replace(/\/api\/license\/activate\/?$/, '/api/points/redeem').replace(/\/api\/license\/verify\/?$/, '/api/points/redeem');
+  const body = { ...payload, deviceId: getDeviceId() };
+  delete body.licenseEndpoint;
+
+  const response = await fetch(targetEndpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    try {
+      return await response.json();
+    } catch {
+      return { ok: false, message: `点数服务返回 ${response.status}` };
+    }
+  }
+  return response.json();
+});
+
+ipcMain.handle('points:consume', async (_event, payload) => postPointsRequest(payload, '/api/points/consume'));
+
+ipcMain.handle('points:refund', async (_event, payload) => postPointsRequest(payload, '/api/points/refund'));
+
 ipcMain.handle('task:run', async (event, payload) => {
-  return runTaskPayload(payload, event);
+  const modelConfig = resolveCloudProxyModelConfig(payload);
+  if (!modelConfig.endpoint || !modelConfig.taskId || !modelConfig.points) {
+    return {
+      ok: false,
+      reason: 'CLOUD_TRANSLATION_CONFIG_MISSING',
+      message: '云端翻译服务配置未完成，请联系维护者。',
+    };
+  }
+  return runTaskPayload({ ...(payload ?? {}), modelConfig }, event);
 });
 
 ipcMain.handle('shell:open-path', async (_event, path) => {
@@ -213,6 +291,30 @@ ipcMain.handle('shell:reveal-path', async (_event, path) => {
   shell.showItemInFolder(path);
   return true;
 });
+
+async function postPointsRequest(payload, apiPath) {
+  const endpoint = payload?.licenseEndpoint;
+  if (!endpoint) {
+    return { ok: false, reason: 'MISSING_LICENSE_ENDPOINT', message: '缺少授权服务地址。' };
+  }
+  const targetEndpoint = endpoint.replace(/\/api\/license\/activate\/?$/, apiPath).replace(/\/api\/license\/verify\/?$/, apiPath);
+  const body = { ...payload, deviceId: getDeviceId() };
+  delete body.licenseEndpoint;
+
+  const response = await fetch(targetEndpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    try {
+      return await response.json();
+    } catch {
+      return { ok: false, message: `点数服务返回 ${response.status}` };
+    }
+  }
+  return response.json();
+}
 
 function runTaskPayload(payload, event) {
   const runner = join(__dirname, '..', 'scripts', 'agent-runner.mjs');
@@ -295,16 +397,29 @@ async function runAutorunTask() {
   const outputName = process.env.AGENT_AUTORUN_OUTPUT_NAME || sourcePath.split(/[\\/]/).pop().replace(/\.ai$/i, '_中文.ai');
   const maxFrames = Number(process.env.AGENT_AUTORUN_MAX_FRAMES || 0);
   const autorunTaskId = process.env.AGENT_AUTORUN_TASK_ID || '';
+  const autorunPoints = Number(process.env.AGENT_AUTORUN_POINTS || 1);
+  const translationRules = parseAutorunTranslationRules(process.env.AGENT_AUTORUN_TRANSLATION_RULES);
+  const modelConfig = resolveCloudProxyModelConfig(
+    {
+      account: config.account,
+      currentTask: autorunTaskId ? { taskId: autorunTaskId, sourcePath, status: 'running' } : null,
+      requiredPoints: autorunPoints,
+    },
+    config,
+  );
 
-  if (!config.modelConfig?.apiKey) {
+  if (!modelConfig.endpoint || !modelConfig.taskId || !modelConfig.points) {
     const rawConfig = existsSync(getConfigPath()) ? readJsonFile(getConfigPath()) : {};
     writeAutorunResult(
       {
         ok: false,
-        message: '缺少模型 API Key，请先在桌面端模型配置里保存 API Key。',
+        message: '云端翻译服务配置未完成，请先激活授权并提供任务编号与点数后重试。',
         diagnostics: {
           configPath: getConfigPath(),
           safeStorageAvailable: safeStorage.isEncryptionAvailable(),
+          hasTranslateEndpoint: Boolean(modelConfig.endpoint),
+          hasTaskId: Boolean(modelConfig.taskId),
+          hasPoints: Boolean(modelConfig.points),
           hasRawModelConfig: Boolean(rawConfig.modelConfig),
           hasRawApiKey: Boolean(rawConfig.modelConfig?.apiKey),
           apiKeyLooksEncrypted: typeof rawConfig.modelConfig?.apiKey === 'string' && rawConfig.modelConfig.apiKey.startsWith('enc:'),
@@ -324,15 +439,32 @@ async function runAutorunTask() {
     outputLocation,
     outputCustomPath,
     maxFrames,
-    sourceLang: '英文',
+    sourceLang: '自动识别',
     targetLang: '简体中文',
+    translationRules,
     glossary: '',
     selectedFile: '',
-    modelConfig: config.modelConfig,
+    modelConfig,
     currentTask: autorunTaskId ? { taskId: autorunTaskId, sourcePath, status: 'running' } : null,
   };
   const result = await runTaskPayload(payload);
   writeAutorunResult(result, resultPath);
+}
+
+function parseAutorunTranslationRules(rawValue) {
+  if (!rawValue) return undefined;
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (!Array.isArray(parsed)) return undefined;
+    return parsed
+      .map((rule) => ({
+        source: String(rule.source || rule.sourceLanguage || '').trim(),
+        target: String(rule.target || rule.targetLanguage || '').trim(),
+      }))
+      .filter((rule) => rule.source && rule.target);
+  } catch {
+    return undefined;
+  }
 }
 
 function writeAutorunResult(result, resultPath = resolve(process.env.AGENT_AUTORUN_RESULT || join(process.cwd(), 'tasks', 'agent-autorun-result.json'))) {

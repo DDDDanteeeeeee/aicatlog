@@ -44,8 +44,12 @@ export function validatePayload(payload) {
   }
 
   const modelConfig = payload.modelConfig || {};
-  if (!modelConfig.endpoint || !modelConfig.model || !modelConfig.apiKey) {
-    throw new Error('Missing model endpoint, model name, or API Key.');
+  if (modelConfig.mode === 'cloud-proxy') {
+    if (!modelConfig.endpoint || !modelConfig.taskId || !Number(modelConfig.points || 0)) {
+      throw new Error('Missing cloud translation proxy configuration.');
+    }
+  } else if (!modelConfig.endpoint || !modelConfig.model || !modelConfig.apiKey) {
+    throw new Error('Missing managed model service configuration.');
   }
 
   const customFont = resolveCustomFont(payload);
@@ -131,12 +135,12 @@ function escapeJson(value) {
   return String(value).replace(/\\\\/g, "\\\\\\\\").replace(/"/g, '\\\\"').replace(/\\r/g, "\\\\r").replace(/\\n/g, "\\\\n").replace(/\\t/g, "\\\\t");
 }
 
-function hasLatinText(value) {
-  return /[A-Za-z]/.test(String(value || ""));
+function hasTranslatableText(value) {
+  return /\S/.test(String(value || ""));
 }
 
 var rows = [];
-var metadata = { sourcePath: sourcePath, scannedAt: String(new Date()), documentName: "", artboards: 0, textFrameCount: 0, latinTextFrameCount: 0, errors: [] };
+var metadata = { sourcePath: sourcePath, scannedAt: String(new Date()), documentName: "", artboards: 0, textFrameCount: 0, translatableTextFrameCount: 0, errors: [] };
 
 try {
   app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
@@ -148,8 +152,8 @@ try {
   for (var i = 0; i < doc.textFrames.length; i++) {
     var frame = doc.textFrames[i];
     var content = frame.contents;
-    if (!hasLatinText(content)) continue;
-    metadata.latinTextFrameCount++;
+    if (!hasTranslatableText(content)) continue;
+    metadata.translatableTextFrameCount++;
     rows.push({ id: "tf_" + i, index: i, kind: String(frame.kind), layer: frame.layer ? frame.layer.name : "", text: String(content) });
   }
   doc.close(SaveOptions.DONOTSAVECHANGES);
@@ -165,7 +169,7 @@ json += '  "metadata": {' +
   '"documentName": "' + escapeJson(metadata.documentName) + '",' +
   '"artboards": ' + metadata.artboards + ',' +
   '"textFrameCount": ' + metadata.textFrameCount + ',' +
-  '"latinTextFrameCount": ' + metadata.latinTextFrameCount + ',' +
+  '"translatableTextFrameCount": ' + metadata.translatableTextFrameCount + ',' +
   '"errors": []' +
   '},\\n';
 json += '  "frames": [\\n';
@@ -197,6 +201,8 @@ var sourceAiPath = "${toJsString(sourceCopyPath)}";
 var translationsPath = "${toJsString(payloadJsxPath)}";
 var outputAiPath = "${toJsString(outputAiPath)}";
 var reportPath = "${toJsString(reportPath)}";
+var previousInteractionLevel = app.userInteractionLevel;
+try { app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS; } catch (e) {}
 
 function hasChinese(text) { return /[\\u3400-\\u9fff]/.test(text); }
 function getFirstAvailableFont(names) {
@@ -247,8 +253,15 @@ for (var i = 0; i < translations.length; i++) {
 var saveOptions = new IllustratorSaveOptions();
 saveOptions.pdfCompatible = true;
 try { saveOptions.compressed = true; } catch (e) {}
-doc.saveAs(new File(outputAiPath), saveOptions);
-doc.close(SaveOptions.DONOTSAVECHANGES);
+var saveError = null;
+try {
+  doc.saveAs(new File(outputAiPath), saveOptions);
+} catch (saveException) {
+  saveError = saveException;
+}
+try { doc.close(SaveOptions.DONOTSAVECHANGES); } catch (closeError) {}
+try { app.userInteractionLevel = previousInteractionLevel; } catch (restoreError) {}
+if (saveError) { throw saveError; }
 
 var report = "{\\n";
 report += '  "outputAiPath": "' + outputAiPath + '",\\n';
@@ -280,8 +293,74 @@ export function parseGlossary(glossary = '') {
     .filter((item) => item.source);
 }
 
-export function buildTranslationRequest({ frames, modelConfig, glossary, sourceLang = 'English', targetLang = 'Simplified Chinese' }) {
+export function normalizeTranslationRules({ translationRules, sourceLang = 'Auto-detect from each text frame', targetLang = 'Simplified Chinese' } = {}) {
+  if (Array.isArray(translationRules) && translationRules.length > 0) {
+    return translationRules
+      .map((rule) => ({
+        sourceLanguage: String(rule.source || rule.sourceLanguage || '').trim(),
+        targetLanguage: String(rule.target || rule.targetLanguage || '').trim(),
+      }))
+      .filter((rule) => rule.sourceLanguage && rule.targetLanguage);
+  }
+  return [{ sourceLanguage: sourceLang, targetLanguage: targetLang }];
+}
+
+export function estimateTranslationPointsForFrames({ frames = [], translationRules = [], fallbackPoints = 0 } = {}) {
+  const characters = Array.isArray(frames)
+    ? frames.reduce((total, frame) => total + String(frame?.text || '').length, 0)
+    : 0;
+  const ruleWeight = Math.max(1, Array.isArray(translationRules) && translationRules.length ? translationRules.length : 1);
+  return Math.max(1, Number(fallbackPoints || 0), Math.ceil((characters * ruleWeight) / 5000));
+}
+
+export function shouldTranslateTextForRules(text, translationRules = []) {
+  const content = String(text || '');
+  const rules = Array.isArray(translationRules) ? translationRules : [];
+  if (!rules.length) return true;
+  return rules.some((rule) => textMatchesSourceLanguage(content, rule.sourceLanguage || rule.source || ''));
+}
+
+function textMatchesSourceLanguage(text, sourceLanguage) {
+  const language = String(sourceLanguage || '').trim().toLowerCase();
+  if (!language || language.includes('auto')) return true;
+  if (language.includes('all') || /[\u5168\u90e8\u6240\u6709]/.test(language)) return true;
+  if (language.includes('chinese') || language.includes('mandarin') || /[\u4e2d\u6587\u6c49\u6f22\u7b80\u7c21\u7e41]/.test(language)) {
+    return /[\u3400-\u9fff\uf900-\ufaff]/.test(text);
+  }
+  if (language.includes('japanese') || /\u65e5\u672c|\u65e5\u8bed|\u65e5\u8a9e|\u65e5\u6587/.test(language)) {
+    return /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]/.test(text);
+  }
+  if (language.includes('korean') || /\u97e9\u8bed|\u97d3\u8a9e|\u671d\u9c9c/.test(language)) {
+    return /[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]/.test(text);
+  }
+  if (
+    language.includes('english') ||
+    language.includes('german') ||
+    language.includes('french') ||
+    language.includes('spanish') ||
+    language.includes('italian') ||
+    language.includes('portuguese')
+  ) {
+    return /[A-Za-z\u00c0-\u024f]/.test(text);
+  }
+  return true;
+}
+
+function resolveTaskModelConfig(modelConfig, frames, translationRules) {
+  if (modelConfig?.mode !== 'cloud-proxy') return modelConfig;
+  return {
+    ...modelConfig,
+    points: estimateTranslationPointsForFrames({
+      frames,
+      translationRules,
+      fallbackPoints: modelConfig.points,
+    }),
+  };
+}
+
+export function buildTranslationRequest({ frames, modelConfig, glossary, sourceLang = 'Auto-detect from each text frame', targetLang = 'Simplified Chinese', translationRules = [] }) {
   const terms = parseGlossary(glossary);
+  const rules = normalizeTranslationRules({ translationRules, sourceLang, targetLang });
   return {
     endpoint: normalizeChatCompletionsEndpoint(modelConfig.endpoint),
     body: {
@@ -292,7 +371,7 @@ export function buildTranslationRequest({ frames, modelConfig, glossary, sourceL
         {
           role: 'system',
           content:
-            'You are a professional catalog localization engine. Return strict JSON only. Preserve numbers, model names, brand names, placeholders, and line breaks when possible.',
+            'You are a professional catalog localization engine. Follow the provided translation rules as hard constraints. Translate only text segments that match a rule source language into that rule target language. If a frame or segment does not match any source-language rule, copy it exactly. Preserve numbers, model names, brand names, placeholders, non-source-language text, and line breaks. Return one translation for every input frame index. Return strict JSON only.',
         },
         {
           role: 'user',
@@ -300,7 +379,13 @@ export function buildTranslationRequest({ frames, modelConfig, glossary, sourceL
             task: 'Translate Illustrator text frames.',
             sourceLanguage: sourceLang,
             targetLanguage: targetLang,
+            translationRules: rules,
             glossary: terms,
+            constraints: {
+              nonMatchingFramePolicy: 'Return the original text unchanged for frames that do not match a source-language rule.',
+              mixedLanguagePolicy: 'Translate only matching source-language segments and preserve every other segment exactly.',
+              completeness: 'Include every input frame index in translations.',
+            },
             outputSchema: { translations: [{ index: 0, translated: '中文' }] },
             frames: frames.map((frame) => ({ index: frame.index, text: frame.text })),
           }),
@@ -323,6 +408,7 @@ export async function translateFrames({
   glossary,
   sourceLang,
   targetLang,
+  translationRules,
   batchSize = 10,
   timeoutMs = 60000,
   cachePath = '',
@@ -351,8 +437,10 @@ export async function translateFrames({
     glossary: glossary || '',
     sourceLang: sourceLang || '',
     targetLang: targetLang || '',
+    translationRules: normalizeTranslationRules({ translationRules, sourceLang, targetLang }),
     cacheScope,
   };
+  const activeRules = cacheContext.translationRules;
 
   for (let index = 0; index < frames.length; index += batchSize) {
     const batch = frames.slice(index, index + batchSize);
@@ -369,6 +457,12 @@ export async function translateFrames({
           original: frame.text,
           translated: String(checkpointTranslation.translated || checkpointTranslation.original || frame.text),
         });
+        continue;
+      }
+
+      if (!shouldTranslateTextForRules(frame.text, activeRules)) {
+        stats.ruleSkips = (stats.ruleSkips || 0) + 1;
+        batchTranslations.push({ index: frame.index, original: frame.text, translated: frame.text });
         continue;
       }
 
@@ -401,6 +495,7 @@ export async function translateFrames({
         glossary,
         sourceLang,
         targetLang,
+        translationRules,
         timeoutMs,
         maxRetries,
         retryDelayMs,
@@ -445,11 +540,11 @@ export async function translateFrames({
   return translations;
 }
 
-async function translateBatchWithRetry({ batch, modelConfig, glossary, sourceLang, targetLang, timeoutMs, maxRetries, retryDelayMs }) {
+async function translateBatchWithRetry({ batch, modelConfig, glossary, sourceLang, targetLang, translationRules, timeoutMs, maxRetries, retryDelayMs }) {
   let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
-      return await translateBatch({ batch, modelConfig, glossary, sourceLang, targetLang, timeoutMs });
+      return await translateBatch({ batch, modelConfig, glossary, sourceLang, targetLang, translationRules, timeoutMs });
     } catch (error) {
       lastError = error;
       if (attempt >= maxRetries) break;
@@ -459,8 +554,11 @@ async function translateBatchWithRetry({ batch, modelConfig, glossary, sourceLan
   throw lastError;
 }
 
-async function translateBatch({ batch, modelConfig, glossary, sourceLang, targetLang, timeoutMs }) {
-  const request = buildTranslationRequest({ frames: batch, modelConfig, glossary, sourceLang, targetLang });
+async function translateBatch({ batch, modelConfig, glossary, sourceLang, targetLang, translationRules, timeoutMs }) {
+  if (modelConfig.mode === 'cloud-proxy') {
+    return translateBatchViaCloudProxy({ batch, modelConfig, glossary, sourceLang, targetLang, translationRules, timeoutMs });
+  }
+  const request = buildTranslationRequest({ frames: batch, modelConfig, glossary, sourceLang, targetLang, translationRules });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const response = await fetch(request.endpoint, {
@@ -473,7 +571,7 @@ async function translateBatch({ batch, modelConfig, glossary, sourceLang, target
     signal: controller.signal,
   }).catch((error) => {
     if (error?.name === 'AbortError') {
-      throw new Error('模型服务请求超时，请检查网络、API Endpoint 或模型服务状态。');
+      throw new Error('模型服务请求超时，请检查网络或模型服务状态。');
     }
     throw error;
   }).finally(() => clearTimeout(timeout));
@@ -483,7 +581,7 @@ async function translateBatch({ batch, modelConfig, glossary, sourceLang, target
     throw new Error(`模型服务请求失败：HTTP ${response.status} ${trimForLog(responseText)}`);
   }
   if (!responseText.trim()) {
-    throw new Error('模型服务返回空响应，请检查 API Endpoint、模型名称、API Key 或账号额度。');
+    throw new Error('模型服务返回空响应，请联系维护者检查模型服务配置或账号额度。');
   }
 
   let data;
@@ -495,6 +593,54 @@ async function translateBatch({ batch, modelConfig, glossary, sourceLang, target
   const content = data.choices?.[0]?.message?.content;
   const parsed = parseModelJsonContent(content);
   const byIndex = new Map(parsed.translations.map((item) => [Number(item.index), String(item.translated || '')]));
+  return batch.map((frame) => ({
+    index: frame.index,
+    original: frame.text,
+    translated: byIndex.get(Number(frame.index)) || frame.text,
+  }));
+}
+
+async function translateBatchViaCloudProxy({ batch, modelConfig, glossary, sourceLang, targetLang, translationRules, timeoutMs }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const response = await fetch(modelConfig.endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      licenseToken: modelConfig.licenseToken || '',
+      activationCode: modelConfig.activationCode || '',
+      deviceId: modelConfig.deviceId || '',
+      email: modelConfig.email || '',
+      taskId: modelConfig.taskId || '',
+      points: Number(modelConfig.points || 0),
+      frames: batch.map((frame) => ({ index: frame.index, text: frame.text })),
+      glossary,
+      sourceLang,
+      targetLang,
+      translationRules,
+    }),
+    signal: controller.signal,
+  }).catch((error) => {
+    if (error?.name === 'AbortError') {
+      throw new Error('云端翻译服务请求超时，请检查网络或稍后继续当前任务。');
+    }
+    throw error;
+  }).finally(() => clearTimeout(timeout));
+
+  const responseText = await response.text();
+  let data = null;
+  try {
+    data = responseText.trim() ? JSON.parse(responseText) : null;
+  } catch {
+    throw new Error(`云端翻译服务返回异常：${trimForLog(responseText)}`);
+  }
+  if (!response.ok || !data?.ok) {
+    throw new Error(data?.message || `云端翻译服务请求失败：HTTP ${response.status}`);
+  }
+
+  const byIndex = new Map((data.translations || []).map((item) => [Number(item.index), String(item.translated || '')]));
   return batch.map((frame) => ({
     index: frame.index,
     original: frame.text,
@@ -694,7 +840,7 @@ async function runAgentTaskLegacy(rawPayload) {
   await writeFile(workspace.extractJsxPath, buildExtractJsx(workspace), 'utf8');
   logs.push('已生成文本提取脚本。');
   await runIllustratorJsx(workspace.extractJsxPath);
-  logs.push('已从 AI 文件提取英文文本。');
+  logs.push('已从 AI 文件提取可翻译文本。');
 
   const extracted = JSON.parse(await readFile(workspace.extractedJsonPath, 'utf8'));
   if (extracted.metadata?.errors?.length) {
@@ -702,14 +848,16 @@ async function runAgentTaskLegacy(rawPayload) {
   }
 
   const framesToTranslate = payload.maxFrames ? extracted.frames.slice(0, Number(payload.maxFrames)) : extracted.frames;
+  const modelConfig = resolveTaskModelConfig(payload.modelConfig, framesToTranslate, payload.translationRules);
   logs.push(payload.maxFrames ? `试运行模式：仅翻译前 ${framesToTranslate.length} 条文本。` : `准备翻译 ${framesToTranslate.length} 条文本。`);
 
   const translations = await translateFrames({
     frames: framesToTranslate,
-    modelConfig: payload.modelConfig,
+    modelConfig,
     glossary: payload.glossary,
     sourceLang: payload.sourceLang,
     targetLang: payload.targetLang,
+    translationRules: payload.translationRules,
     cachePath: workspace.cachePath,
     checkpointPath: workspace.translationsJsonPath,
     cacheScope: await getSourceCacheScope(payload.sourcePath),
@@ -753,9 +901,9 @@ export async function runAgentTask(rawPayload, options = {}) {
   await writeFile(workspace.extractJsxPath, buildExtractJsx(workspace), 'utf8');
   logs.push('已生成文本提取脚本。');
 
-  emitProgress(onProgress, { stage: 'extracting', message: '正在通过 Illustrator 打开源文件并提取英文文本。', percent: 15 });
+  emitProgress(onProgress, { stage: 'extracting', message: '正在通过 Illustrator 打开源文件并提取可翻译文本。', percent: 15 });
   await runIllustratorJsx(workspace.extractJsxPath);
-  logs.push('已从 AI 文件提取英文文本。');
+  logs.push('已从 AI 文件提取可翻译文本。');
 
   const extracted = JSON.parse(await readFile(workspace.extractedJsonPath, 'utf8'));
   if (extracted.metadata?.errors?.length) {
@@ -763,10 +911,11 @@ export async function runAgentTask(rawPayload, options = {}) {
   }
 
   const framesToTranslate = payload.maxFrames ? extracted.frames.slice(0, Number(payload.maxFrames)) : extracted.frames;
+  const modelConfig = resolveTaskModelConfig(payload.modelConfig, framesToTranslate, payload.translationRules);
   logs.push(payload.maxFrames ? `试运行模式：仅翻译前 ${framesToTranslate.length} 条文本。` : `准备翻译 ${framesToTranslate.length} 条文本。`);
   emitProgress(onProgress, {
     stage: 'extracted',
-    message: `已提取 ${extracted.frames.length} 条英文文本，准备处理 ${framesToTranslate.length} 条。`,
+    message: `已提取 ${extracted.frames.length} 条可翻译文本，准备处理 ${framesToTranslate.length} 条。`,
     current: 0,
     total: framesToTranslate.length,
     percent: 30,
@@ -774,10 +923,11 @@ export async function runAgentTask(rawPayload, options = {}) {
 
   const translations = await translateFrames({
     frames: framesToTranslate,
-    modelConfig: payload.modelConfig,
+    modelConfig,
     glossary: payload.glossary,
     sourceLang: payload.sourceLang,
     targetLang: payload.targetLang,
+    translationRules: payload.translationRules,
     cachePath: workspace.cachePath,
     checkpointPath: workspace.translationsJsonPath,
     cacheScope: await getSourceCacheScope(payload.sourcePath),
@@ -804,9 +954,15 @@ export async function runAgentTask(rawPayload, options = {}) {
     startedAt: new Date(startedAt).toISOString(),
     finishedAt: new Date().toISOString(),
     durationMs: Date.now() - startedAt,
-    provider: payload.modelConfig.provider || '',
-    model: payload.modelConfig.model || '',
+    provider: modelConfig.provider || '',
+    model: modelConfig.model || '',
+    requiredPoints: modelConfig.mode === 'cloud-proxy' ? modelConfig.points : undefined,
     targetLang: payload.targetLang || '',
+    translationRules: normalizeTranslationRules({
+      translationRules: payload.translationRules,
+      sourceLang: payload.sourceLang,
+      targetLang: payload.targetLang,
+    }),
     totalTextFrames: extracted.metadata?.textFrameCount ?? extracted.frames.length,
     latinTextFrames: extracted.frames.length,
     requestedTranslations: framesToTranslate.length,

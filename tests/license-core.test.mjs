@@ -3,9 +3,12 @@ import assert from 'node:assert/strict';
 import {
   activateLicense,
   addActivationCode,
+  consumePoints,
   createEmptyStore,
   disableCode,
+  redeemPointsCode,
   resetDeviceBinding,
+  refundPoints,
   verifyLicense,
 } from '../server/license-core.mjs';
 
@@ -160,4 +163,182 @@ test('saved license token verifies without asking user to reactivate', () => {
   assert.equal(verified.ok, true);
   assert.equal(verified.plan, 'monthly');
   assert.equal(verified.expiresAt, code.expiresAt);
+});
+
+test('activation code can include initial points', () => {
+  const store = createEmptyStore();
+  const code = addActivationCode(store, { plan: 'standard', points: 100 });
+
+  const activated = activateLicense(store, {
+    activationCode: code.displayCode,
+    deviceId: 'device-a',
+  });
+
+  assert.equal(activated.ok, true);
+  assert.equal(activated.pointsBalance, 100);
+
+  const verified = verifyLicense(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+  });
+  assert.equal(verified.pointsBalance, 100);
+});
+
+test('points code can be redeemed once and consumed', () => {
+  const store = createEmptyStore();
+  const licenseCode = addActivationCode(store, { plan: 'standard' });
+  const pointsCode = addActivationCode(store, { plan: 'standard', points: 30 });
+  const activated = activateLicense(store, {
+    activationCode: licenseCode.displayCode,
+    deviceId: 'device-a',
+  });
+
+  const redeemed = redeemPointsCode(store, {
+    licenseToken: activated.licenseToken,
+    redeemCode: pointsCode.displayCode,
+    deviceId: 'device-a',
+  });
+  assert.equal(redeemed.ok, true);
+  assert.equal(redeemed.redeemedPoints, 30);
+  assert.equal(redeemed.pointsBalance, 30);
+
+  const duplicate = redeemPointsCode(store, {
+    licenseToken: activated.licenseToken,
+    redeemCode: pointsCode.displayCode,
+    deviceId: 'device-a',
+  });
+  assert.equal(duplicate.ok, false);
+  assert.equal(duplicate.reason, 'CODE_REDEEMED');
+
+  const consumed = consumePoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 12,
+    taskId: 'task-1',
+  });
+  assert.equal(consumed.ok, true);
+  assert.equal(consumed.pointsBalance, 18);
+});
+
+test('consume points rejects insufficient balance', () => {
+  const store = createEmptyStore();
+  const code = addActivationCode(store, { plan: 'standard', points: 5 });
+  const activated = activateLicense(store, {
+    activationCode: code.displayCode,
+    deviceId: 'device-a',
+  });
+
+  const result = consumePoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 6,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'INSUFFICIENT_POINTS');
+  assert.equal(result.pointsBalance, 5);
+});
+
+test('refund points restores failed task charge once', () => {
+  const store = createEmptyStore();
+  const code = addActivationCode(store, { plan: 'standard', points: 20 });
+  const activated = activateLicense(store, {
+    activationCode: code.displayCode,
+    deviceId: 'device-a',
+  });
+
+  const consumed = consumePoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 7,
+    taskId: 'task-failed',
+  });
+  assert.equal(consumed.ok, true);
+  assert.equal(consumed.pointsBalance, 13);
+
+  const refunded = refundPoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 7,
+    taskId: 'task-failed',
+  });
+  assert.equal(refunded.ok, true);
+  assert.equal(refunded.refundedPoints, 7);
+  assert.equal(refunded.pointsBalance, 20);
+
+  const duplicate = refundPoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 7,
+    taskId: 'task-failed',
+  });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.alreadyRefunded, true);
+  assert.equal(duplicate.pointsBalance, 20);
+});
+
+test('consume points is idempotent for the same charged task', () => {
+  const store = createEmptyStore();
+  const code = addActivationCode(store, { plan: 'standard', points: 20 });
+  const activated = activateLicense(store, {
+    activationCode: code.displayCode,
+    deviceId: 'device-a',
+  });
+
+  const first = consumePoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 7,
+    taskId: 'task-repeat',
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.pointsBalance, 13);
+
+  const second = consumePoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 7,
+    taskId: 'task-repeat',
+  });
+  assert.equal(second.ok, true);
+  assert.equal(second.alreadyConsumed, true);
+  assert.equal(second.pointsBalance, 13);
+});
+
+test('refund points rejects missing or excessive task charges', () => {
+  const store = createEmptyStore();
+  const code = addActivationCode(store, { plan: 'standard', points: 20 });
+  const activated = activateLicense(store, {
+    activationCode: code.displayCode,
+    deviceId: 'device-a',
+  });
+
+  const forged = refundPoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 7,
+    taskId: 'task-never-charged',
+  });
+  assert.equal(forged.ok, false);
+  assert.equal(forged.reason, 'TASK_CHARGE_NOT_FOUND');
+  assert.equal(forged.pointsBalance, 20);
+
+  const consumed = consumePoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 7,
+    taskId: 'task-over-refund',
+  });
+  assert.equal(consumed.ok, true);
+  assert.equal(consumed.pointsBalance, 13);
+
+  const excessive = refundPoints(store, {
+    licenseToken: activated.licenseToken,
+    deviceId: 'device-a',
+    points: 8,
+    taskId: 'task-over-refund',
+  });
+  assert.equal(excessive.ok, false);
+  assert.equal(excessive.reason, 'REFUND_EXCEEDS_CHARGE');
+  assert.equal(excessive.pointsBalance, 13);
 });
